@@ -4,6 +4,7 @@
 // that can be found in the LICENSE file in the root of the source
 // tree.
 
+//go:build ignore
 // +build ignore
 
 package main
@@ -16,9 +17,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"github.com/Doridian/gopacket"
+	"github.com/Doridian/gopacket/layers"
+	"github.com/Doridian/gopacket/pcap"
 )
 
 var input = flag.String("i", "", "Input filename")
