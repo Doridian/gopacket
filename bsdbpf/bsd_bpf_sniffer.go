@@ -16,6 +16,8 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/google/gopacket/pcap"
+
 	"github.com/Doridian/gopacket"
 	"golang.org/x/sys/unix"
 )
@@ -23,7 +25,7 @@ import (
 const wordSize = int(unsafe.Sizeof(uintptr(0)))
 
 func bpfWordAlign(x int) int {
-	return (((x) + (wordSize - 1)) &^ (wordSize - 1))
+	return ((x) + (wordSize - 1)) &^ (wordSize - 1)
 }
 
 // Options is used to configure various properties of the BPF sniffer.
@@ -59,7 +61,7 @@ type Options struct {
 	// as provided, to the wire.
 	// The default is true.
 	PreserveLinkAddr bool
-	// SeeSent is set to true to capture packets sent on the interface, false to only capture received packets.
+	// SeeSent is set to false if locally generated packets on the interface should not be returned by BPF.
 	// The default is true.
 	SeeSent bool
 }
@@ -102,34 +104,32 @@ func NewBPFSniffer(iface string, options *Options) (*BPFSniffer, error) {
 		sniffer.options = options
 	}
 
-	if sniffer.options.BPFDeviceName == "" {
-		sniffer.pickBpfDevice()
-	}
+	sniffer.pickBpfDevice()
 
 	// setup our read buffer
 	if sniffer.options.ReadBufLen == 0 {
 		sniffer.options.ReadBufLen, err = syscall.BpfBuflen(sniffer.fd)
 		if err != nil {
-			return nil, err
+			goto err
 		}
 	} else {
 		sniffer.options.ReadBufLen, err = syscall.SetBpfBuflen(sniffer.fd, sniffer.options.ReadBufLen)
 		if err != nil {
-			return nil, err
+			goto err
 		}
 	}
 	sniffer.readBuffer = make([]byte, sniffer.options.ReadBufLen)
 
 	err = syscall.SetBpfInterface(sniffer.fd, sniffer.sniffDeviceName)
 	if err != nil {
-		return nil, err
+		goto err
 	}
 
 	if sniffer.options.Immediate {
 		// turn immediate mode on. This makes the snffer non-blocking.
 		err = syscall.SetBpfImmediate(sniffer.fd, enable)
 		if err != nil {
-			return nil, err
+			goto err
 		}
 	}
 
@@ -139,7 +139,7 @@ func NewBPFSniffer(iface string, options *Options) (*BPFSniffer, error) {
 	if sniffer.options.Timeout != nil {
 		err = syscall.SetBpfTimeout(sniffer.fd, sniffer.options.Timeout)
 		if err != nil {
-			return nil, err
+			goto err
 		}
 	}
 
@@ -148,7 +148,7 @@ func NewBPFSniffer(iface string, options *Options) (*BPFSniffer, error) {
 		// higher level protocol analyzers will not need this
 		err = syscall.SetBpfHeadercmpl(sniffer.fd, enable)
 		if err != nil {
-			return nil, err
+			goto err
 		}
 	}
 
@@ -156,7 +156,15 @@ func NewBPFSniffer(iface string, options *Options) (*BPFSniffer, error) {
 		// forces the interface into promiscuous mode
 		err = syscall.SetBpfPromisc(sniffer.fd, enable)
 		if err != nil {
-			return nil, err
+			goto err
+		}
+	}
+
+	if !sniffer.options.SeeSent {
+		// See sent is set by default, need to turn it off
+		err = unix.IoctlSetInt(sniffer.fd, syscall.BIOCSSEESENT, 0)
+		if err != nil {
+			goto err
 		}
 	}
 
@@ -170,6 +178,9 @@ func NewBPFSniffer(iface string, options *Options) (*BPFSniffer, error) {
 	}
 
 	return &sniffer, nil
+err:
+	syscall.Close(sniffer.fd)
+	return nil, err
 }
 
 // Close is used to close the file-descriptor of the BPF device file.
@@ -179,12 +190,25 @@ func (b *BPFSniffer) Close() error {
 
 func (b *BPFSniffer) pickBpfDevice() {
 	var err error
-	b.options.BPFDeviceName = ""
-	for i := 0; i < 99; i++ {
-		b.options.BPFDeviceName = fmt.Sprintf("/dev/bpf%d", i)
+	if len(b.options.BPFDeviceName) > 0 {
 		b.fd, err = syscall.Open(b.options.BPFDeviceName, syscall.O_RDWR, 0)
 		if err == nil {
 			return
+		}
+	} else {
+		b.options.BPFDeviceName = ""
+		for i := 0; i < 99; i++ {
+			name := fmt.Sprintf("/dev/bpf%d", i)
+			b.fd, err = syscall.Open(b.options.BPFDeviceName, syscall.O_RDWR, 0)
+			if err == nil {
+				b.options.BPFDeviceName = name
+				return
+			}
+
+			if err == syscall.Errno(syscall.ENOENT) {
+				// No such file, no needs to iterate further
+				break
+			}
 		}
 	}
 	panic("failed to acquire a BPF device for read-write access")
@@ -226,4 +250,24 @@ func (b *BPFSniffer) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
 // GetReadBufLen returns the BPF read buffer length
 func (b *BPFSniffer) GetReadBufLen() int {
 	return b.options.ReadBufLen
+}
+
+func (s *BPFSniffer) SetBPFFilter(bpfInstructions []pcap.BPFInstruction) error {
+	bpfIns := make([]syscall.BpfInsn, 0, len(bpfInstructions))
+	for _, ins := range bpfInstructions {
+		sysIns := syscall.BpfInsn{
+			Code: ins.Code,
+			Jt:   ins.Jt,
+			Jf:   ins.Jf,
+			K:    ins.K,
+		}
+		bpfIns = append(bpfIns, sysIns)
+	}
+
+	return syscall.SetBpf(s.fd, bpfIns)
+}
+
+func (h *BPFSniffer) WritePacketData(pkt []byte) error {
+	_, err := unix.Write(h.fd, pkt)
+	return err
 }
