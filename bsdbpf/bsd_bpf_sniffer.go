@@ -16,9 +16,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/google/gopacket/pcap"
-
 	"github.com/Doridian/gopacket"
+	"github.com/Doridian/gopacket/pcap"
 	"golang.org/x/sys/unix"
 )
 
