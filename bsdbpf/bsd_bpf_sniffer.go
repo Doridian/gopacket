@@ -17,7 +17,6 @@ import (
 	"unsafe"
 
 	"github.com/Doridian/gopacket"
-	"github.com/Doridian/gopacket/pcap"
 	"golang.org/x/sys/unix"
 )
 
@@ -249,21 +248,6 @@ func (b *BPFSniffer) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
 // GetReadBufLen returns the BPF read buffer length
 func (b *BPFSniffer) GetReadBufLen() int {
 	return b.options.ReadBufLen
-}
-
-func (s *BPFSniffer) SetBPFFilter(bpfInstructions []pcap.BPFInstruction) error {
-	bpfIns := make([]syscall.BpfInsn, 0, len(bpfInstructions))
-	for _, ins := range bpfInstructions {
-		sysIns := syscall.BpfInsn{
-			Code: ins.Code,
-			Jt:   ins.Jt,
-			Jf:   ins.Jf,
-			K:    ins.K,
-		}
-		bpfIns = append(bpfIns, sysIns)
-	}
-
-	return syscall.SetBpf(s.fd, bpfIns)
 }
 
 func (h *BPFSniffer) WritePacketData(pkt []byte) error {
