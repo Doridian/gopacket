@@ -20,10 +20,32 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const wordSize = int(unsafe.Sizeof(uintptr(0)))
-
+// bpfAlignment mirrors the kernel's BPF_ALIGNMENT and is defined per OS
+// in bpf_align_*.go, since it is not the same on every BSD.
 func bpfWordAlign(x int) int {
-	return ((x) + (wordSize - 1)) &^ (wordSize - 1)
+	return ((x) + (bpfAlignment - 1)) &^ (bpfAlignment - 1)
+}
+
+const bpfHdrSize = int(unsafe.Sizeof(unix.BpfHdr{}))
+
+var errCorruptBpfHdr = errors.New("BPF captured frame received with corrupted BpfHdr struct.")
+
+// nextBpfFrame parses the BPF header found at offset off of buf, which must
+// contain exactly the bytes returned by read(). It returns the header (nil if
+// not even a full header fits), the captured frame and the offset of the
+// next header. On error the returned offset is len(buf), so that the rest
+// of the buffer is discarded.
+func nextBpfFrame(buf []byte, off int) (*unix.BpfHdr, []byte, int, error) {
+	if off < 0 || off+bpfHdrSize > len(buf) {
+		return nil, nil, len(buf), errCorruptBpfHdr
+	}
+	hdr := (*unix.BpfHdr)(unsafe.Pointer(&buf[off]))
+	frameStart := off + int(hdr.Hdrlen)
+	frameEnd := frameStart + int(hdr.Caplen)
+	if hdr.Hdrlen == 0 || frameEnd > len(buf) {
+		return hdr, nil, len(buf), errCorruptBpfHdr
+	}
+	return hdr, buf[frameStart:frameEnd], off + bpfWordAlign(frameEnd-off), nil
 }
 
 // Options is used to configure various properties of the BPF sniffer.
@@ -214,20 +236,20 @@ func (b *BPFSniffer) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
 			return nil, gopacket.CaptureInfo{}, err
 		}
 	}
-	hdr := (*unix.BpfHdr)(unsafe.Pointer(&b.readBuffer[b.readBytesConsumed]))
-	frameStart := b.readBytesConsumed + int(hdr.Hdrlen)
-	b.readBytesConsumed += bpfWordAlign(int(hdr.Hdrlen) + int(hdr.Caplen))
-
-	if frameStart+int(hdr.Caplen) > len(b.readBuffer) {
-		captureInfo := gopacket.CaptureInfo{
-			Timestamp:     time.Unix(int64(hdr.Tstamp.Sec), int64(hdr.Tstamp.Usec)*1000),
-			CaptureLength: 0,
-			Length:        0,
-		}
-		return nil, captureInfo, errors.New("BPF captured frame received with corrupted BpfHdr struct.")
+	if b.lastReadLen == 0 {
+		return b.readBuffer[:0], gopacket.CaptureInfo{}, nil
 	}
 
-	rawFrame := b.readBuffer[frameStart : frameStart+int(hdr.Caplen)]
+	hdr, rawFrame, next, err := nextBpfFrame(b.readBuffer[:b.lastReadLen], b.readBytesConsumed)
+	b.readBytesConsumed = next
+	if err != nil {
+		captureInfo := gopacket.CaptureInfo{}
+		if hdr != nil {
+			captureInfo.Timestamp = time.Unix(int64(hdr.Tstamp.Sec), int64(hdr.Tstamp.Usec)*1000)
+		}
+		return nil, captureInfo, err
+	}
+
 	captureInfo := gopacket.CaptureInfo{
 		Timestamp:     time.Unix(int64(hdr.Tstamp.Sec), int64(hdr.Tstamp.Usec)*1000),
 		CaptureLength: len(rawFrame),
